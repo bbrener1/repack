@@ -1,16 +1,16 @@
 #[macro_use]
 extern crate ndarray;
 extern crate num_traits;
-// extern crate ndarray_linalg;
+extern crate ndarray_linalg;
 
 
 use std::fmt::Debug;
 use std::ops::{DivAssign,MulAssign,SubAssign,Mul,Neg};
 use std::cmp::{max,min,PartialOrd,Ordering};
-use ndarray::{Axis,ArrayBase,ArrayViewMut2,ArrayViewMut1,ArrayView2,Array1,Array2,Ix2};
-use num_traits::{Zero,One,CheckedNeg};
+use ndarray::{Axis,Array,ArrayBase,ArrayViewMut2,ArrayViewMut1,ArrayView2,Array1,Array2,Ix2};
+use num_traits::{Zero,One,Signed};
 // use ndarray_linalg::layout::MatrixLayout;
-// use ndarray_linalg::lapack::{Pivot,Transpose,UPLO,into_result};
+use ndarray_linalg::lapack::{Pivot,Transpose,UPLO,into_result};
 // use ndarray_linalg::error::*;
 // use ndarray_linalg::triangular::{Diag};
 // use ndarray_linalg::{Scalar};
@@ -41,9 +41,9 @@ const SAFE_MIN:f64 = 1e-200;
 //
 //
 
-fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign>(mut x:ArrayViewMut2<T>,mut ipiv: &mut [usize]) -> Option<()>
+fn rgetrf<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign>(mut x:ArrayViewMut2<T>,mut ipiv: &mut [usize]) -> Option<()>
     where
-        T: Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
+        T: Signed + Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
 {
 
     // Port of the LAPACK 3.9.0 dgetrf2 LU Factorization Algorithm
@@ -68,15 +68,10 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
 
     // Then we "update" A22 by calling a matrix multiplication A22 -= A21 * A12.
 
-    // At this point we recurse again by calling rgetrf2 on A22.
+    // At this point we recurse again by calling rgetrf on A22.
 
-    // ON THE BUFFER:
-
-    // A fundamental limitation of the ndarray rust implementation is that you cannot borrow multiple mutable slices of the same array,
-    // even if they do not overlap. For this reason we will need a buffer in which to place the outputs of operatatons involving parts of the array
-
-
-    //
+    // TODO: We should probably consider implementing the block version as well.
+    // TODO: Make sure boudns checks are all there.
 
     let (m,n) = x.dim();
     let k = min(m,n);
@@ -86,7 +81,7 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
     }
 
     if m == 1 {
-        x[[0,0]] = T::one();
+        if x[[0,0]] == T::zero() {return None}
         ipiv[0] = 0;
         return Some(())
     }
@@ -97,31 +92,43 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
         // This is the single-column case. In the single column case we find the max, then swap it to the head of the column
         // After that we scale by the max
 
-        let max = argmax(x.iter()).expect(&format!("Failed argmax: {:?}",x));
+        let max = argmax(x.iter().map(|v| v.abs())).expect(&format!("Failed argmax: {:?}",x));
         x.swap([0,0],[max,0]);
         let max_val = x[[0,0]];
-        x /= max_val;
-
+        if max_val != T::zero() {
+            for i in 1..m {
+                x[[i,0]] /= max_val;
+            }
+        }
+        else {return None};
         ipiv[0] = max;
 
+        // println!("Single");
+        // println!("{:?}",x);
+        // println!("{:?}",ipiv);
+        // println!("==========");
+
+        return Some(())
 
     }
     else {
         // This is the recursive case
 
         let n1 = k/2;
-        let n2 = n-n1;
 
         // Here we make the recursive call to solve [A11]/[A21]
         //
-        rgetrf2(x.slice_mut(s![..,..n1]),&mut ipiv[..n1]);
+
+        // println!("A11/A21");
+        rgetrf(x.slice_mut(s![..,..n1]),&mut ipiv[..n1])?;
 
         // We perform the same swaps on [A12]/[A22] for synchronicity
 
         for (row,pivot) in ipiv[..n1].iter().enumerate() {
-            for j in n1..n {
-                x.swap([row,j],[*pivot,j]);
-            }
+            row_swap(&mut x.slice_mut(s![..,n1..]), row, *pivot);
+            // for j in n1..n {
+            //     x.swap([row,j],[*pivot,j]);
+            // }
         }
 
         // Now we solve for A12.
@@ -130,7 +137,7 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
             // This expression is enclosed in a block to allow the a11 and a12 references to drop
             // after execution is finished
             let (a11,a12) = x.slice_mut(s![..n1,..]).split_at(Axis(1),n1);
-            rtrsm(a11.view(),a12);
+            rtrsm(a11.view(),a12,true,UPLO::Lower);
         }
 
         // We update A22:
@@ -154,7 +161,8 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
 
         // We recursively factor A22
 
-        rgetrf2(x.slice_mut(s![n1..,n1..]),&mut ipiv[n1..]);
+        // println!("A22");
+        rgetrf(x.slice_mut(s![n1..,n1..]),&mut ipiv[n1..])?;
 
         // We update the pivot indices with the offset
 
@@ -165,10 +173,14 @@ fn rgetrf2<T:Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + Di
         // Finally we perform the second set of pivots, which are updating A21
 
         for (row,pivot) in (n1..n).zip(ipiv[n1..].iter()) {
-            for j in 0..n1 {
-                x.swap([row,j],[*pivot,j]);
-            }
+            row_swap(&mut x.slice_mut(s![..,..n1]), row, *pivot);
+            // for j in 0..n1 {
+            //     x.swap([row,j],[*pivot,j]);
+            // }
         }
+
+        // println!("{:?}",x);
+        // println!("{:?}",ipiv);
 
         return Some(())
 
@@ -186,6 +198,8 @@ where
     // This is a forward substitution procedure solving A * X = B, assuming A is a lower unit triangular
     // B is replaced by a solution
 
+    // Pretty sure this isn't robust yet. Compare against LAPACK reference later
+
     // TODO: bounds checks, quick error return
 
     let (m,n) = a.dim();
@@ -198,67 +212,109 @@ where
 }
 
 
-pub fn rtrsm<T>(a: ArrayView2<T>,mut b: ArrayViewMut2<T>)
+pub fn rtrsm<T>(a: ArrayView2<T>,mut b: ArrayViewMut2<T>,unit:bool,uplo:UPLO)
 where
     T: Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
 {
-    // This is a more general triangular solver adapted from LAPACK
+    // This is a more general triangular solver adapted from LAPACK 3.9.0 gtrsm
+    // Operates only on values resting in the appropriate triangle
 
     // TODO bounds checks:
     //  0 dims
 
-    //TODO scaling?
-
-
     let (m,n) = a.dim();
 
-    for j in 0..n {
-        for k in 0..m {
-            let bkj = b[[k,j]];
-            if bkj != T::zero() {
-                for i in k+1..m {
-                    b[[i,j]] -= bkj * a[[i,k]];
+    match uplo {
+        UPLO::Lower => {
+            for j in 0..n {
+                for k in 0..m {
+                    let bkj = if unit {b[[k,j]]} else {b[[k,j]] / a[[k,k]]};
+                    if bkj != T::zero() {
+                        for i in k+1..m {
+                            b[[i,j]] -= bkj * a[[i,k]];
+                        }
+                    }
                 }
             }
-        }
+        },
+        UPLO::Upper => {
+            for j in 0..n {
+                for k in (0..m).rev() {
+                    let bkj = if unit {b[[k,j]]} else {b[[k,j]] / a[[k,k]]};
+                    if bkj != T::zero() {
+                        for i in k+1..m {
+                            b[[i,j]] -= bkj * a[[i,k]];
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+
+}
+
+pub fn rgetrs<T>(a:ArrayView2<T>,mut b:ArrayViewMut2<T>,ipiv:&[usize])
+where
+    T: Signed + Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
+{
+    // This is a general linear system solver that is used on the output of the LU decomposition.
+
+    // Permutes B to a matching form for synchronicity
+    for (row,pivot) in ipiv.iter().enumerate() {
+        row_swap(&mut b, row, *pivot)
+    }
+
+    // Uses pre-written triangular solver
+
+    rtrsm(a,b.slice_mut(s![..,..]),true,UPLO::Lower);
+    rtrsm(a,b,false,UPLO::Upper);
+
+}
+
+pub fn rgecon<T>(a: ArrayView2<T>,norm:char,anorm:f64) {
+    // Estimates the reciprocal of the condition number of a matrix given LU factorization
+
+    //
+
+    // Requires 1 & inf norm estimation of matrix and the inverse.
+
+    //Layout:
+
+    // 1. estimate 1 norm iteratively: dlacn2 port (holy shit dlacn2 is uhhh... not the best)
+    // if failure: multiply by inv(L)
+    //             multiply by inv(U)
+    // or transpose depending on norm
+
+    // scale by sl/su (a lot of weird conditionals)
+
+}
+
+pub fn rluinv<T>(mut a:ArrayViewMut2<T>,) -> Array2<T>
+where
+    T: Signed + Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
+{
+    // Inverts a matrix in place via LU decomposition
+    // Very hacked out, for the moment
+    // More bounds checks?
+    // Model on existing LAPACK?
+
+    let (m,n) = a.dim();
+    if m!=n {panic!("Tried to invert an array that wasn't square")}
+    let k = m;
+    let mut ipiv = vec![0;k];
+    rgetrf(a.view_mut(),&mut ipiv).expect("Matrix is singular");
+    let mut id: Array2<T> = Array::eye(k);
+    rgetrs(a.view(),id.view_mut(),&ipiv);
+    return id
+}
+
+pub fn row_swap<T>(a:&mut ArrayViewMut2<T>,r1:usize,r2:usize) {
+    for i in 0..a.dim().1 {
+        a.swap([r1,i],[r2,i]);
     }
 }
 
-//
-// pub fn rtrsm_unified<T>(mut a: ArrayViewMut2<T>,m:usize,n:usize)
-// where
-//     T:  Zero + One + PartialOrd + Debug + LinalgScalar + ScalarOperand + DivAssign + MulAssign + SubAssign + Neg<Output=T>,
-// {
-//     // ndarray-rust cannot borrow two mutable subslices from the same array, so if we want to do this with
-//     // few allocations we have to do some gymnastics.
-//
-//     // This function solves an arbitrary triangular matrix equation A * X = B where A is unit lower triangular.
-//     // Unlike the general rtrsm, both A and B are contained in the same mutable array view, stacked by column
-//
-//     // a is the [A | B] block matrix. The B block is replaced by the solution X.
-//
-//     // For this reason the argument must specify the dimension of A. (Dimension of B is implied)
-//
-//     let (um, un) = a.dim();
-//
-//     // We compute the offsets for indexing into B:
-//
-//     let (bm,bn) = (0,un-n);
-//
-//     for j in 0..n {
-//         for k in 0..m {
-//             let bkj = a[[bm+k,bn+j]];
-//             if bkj != T::zero() {
-//                 for i in k+1..m {
-//                     let v = a[[i,k]];
-//                     a[[bm+i,bn+j]] -= bkj * v;
-//                 }
-//             }
-//         }
-//     }
-// }
-
-// fn solve_triangular(&self, uplo: UPLO, diag: Diag, b: &ArrayBase<S, D>) -> Result<Array<A, D>>;
 
 pub fn argmax<T:Iterator<Item=U>,U:PartialOrd + PartialEq>(input: T) -> Option<usize> {
     let mut maximum: Option<(usize,U)> = None;
@@ -304,7 +360,40 @@ mod tests {
     fn generic_square_f() -> Array2<f64> {
         array![[4.,2.,3.],
                [0.,5.,-2.],
-               [0.,1.,-3.]]        
+               [0.,1.,-3.]]
+    }
+
+    fn generic_square_f_2() -> Array2<f64> {
+        array![
+            [  4.,  12., -16.],
+            [ 12.,  37., -43.],
+            [-16., -43.,  98.]
+        ]
+    }
+
+    fn generic_square_f_3() -> Array2<f64> {
+        array![[4.,2.,3.],
+               [1.,5.,-2.],
+               [1.,1.,-3.]]
+    }
+
+    fn generic_square_f_4() -> Array2<f64> {
+        array![[4.,2.,3.],
+               [2.,5.,-2.],
+               [3.,-2.,-3.]]
+    }
+
+    fn generic_square_f_5() -> Array2<f64> {
+        array![ [ -2.,   8., -10.],
+                [  4.,  -2.,   5.],
+                [ -8.,   8.,  -6.]]
+    }
+
+    fn singular_square_f_6() -> Array2<f64> {
+        array![ [ -2.,   8., -10., 0.],
+                [  4.,  -2.,   5., 1.],
+                [ -8.,   8.,  -6., 3.],
+                [ -4.,   16., -20., 0.]]
     }
 
     fn lower_triangular_f_square() -> (Array2<f64>,Array2<f64>) {
@@ -344,22 +433,96 @@ mod tests {
     #[test]
     fn rtrsm_test_f() {
         let (mut m,mut b) = lower_triangular_f_square();
-        rtrsm(m.view(),b.view_mut());
+        rtrsm(m.view(),b.view_mut(),true,UPLO::Lower);
         println!("{:?}",b);
         println!("{:?}",m.dot(&b));
         panic!();
     }
-    //
-    // #[test]
-    // fn rtrsm_test_f_unified() {
-    //     let mut m = lower_triangular_f_square_unified();
-    //     rtrsm_unified(m.view_mut(),3,3);
-    //     println!("{:?}",m);
-    //     let a = m.slice(s![..,..3]);
-    //     let b = m.slice(s![..,3..]);
-    //     println!("{:?}",a.dot(&b));
-    //     panic!();
-    // }
 
+    #[test]
+    fn rgetrf_test() {
+        let mut square = generic_square_f();
+        let mut pivots = vec![0;3];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn rgetrf_test_2() {
+        let mut square = generic_square_f_2();
+        let mut pivots = vec![0;3];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn rgetrf_test_3() {
+        let mut square = generic_square_f_3();
+        let mut pivots = vec![0;3];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn rgetrf_test_4() {
+        let mut square = generic_square_f_4();
+        let mut pivots = vec![0;3];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn rgetrf_test_5() {
+        let mut square = generic_square_f_5();
+        let mut pivots = vec![0;3];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn rgetrf_test_singular() {
+        let mut square = singular_square_f_6();
+        let mut pivots = vec![0;4];
+        rgetrf(square.view_mut(),&mut pivots);
+        println!("{:?}",square);
+        println!("{:?}",pivots);
+        panic!();
+    }
+
+    #[test]
+    fn lu_lapack_test() {
+
+        use ndarray_linalg::solve::Factorize;
+
+        let mut square = generic_square_f();
+        let mut pivots = vec![0;3];
+        let f = square.factorize().unwrap();
+        println!("{:?}",square);
+        println!("{:?}",f.a);
+        panic!();
+    }
+
+    #[test]
+    fn lu_lapack_singular_test() {
+
+        use ndarray_linalg::solve::Factorize;
+
+        let mut square = singular_square_f_6();
+        let mut pivots = vec![0;4];
+        let f = square.factorize().unwrap();
+        println!("{:?}",square);
+        println!("{:?}",f.a);
+        panic!();
+    }
 
 }
